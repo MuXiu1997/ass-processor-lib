@@ -19,6 +19,9 @@ import { runAssfontsCli } from './assfonts-cli.ts'
 const SEPARATOR = '='.repeat(60)
 const DASH_LINE = '-'.repeat(60)
 
+const FONT_EXTENSIONS = ['.ttf', '.otf', '.ttc', '.woff', '.woff2']
+const SUBTITLE_EXTENSIONS = ['.ass', '.ssa', '.srt']
+
 // ============================================================================
 // 类型定义
 // ============================================================================
@@ -135,9 +138,10 @@ export class BatchProcessor {
   private async prepareDirectory(
     path: string,
     description: string,
+    options?: { allowedExtensions?: string[] },
   ): Promise<string> {
     try {
-      return await this.cache.getOrPrepare(path, description)
+      return await this.cache.getOrPrepare(path, description, options)
     } catch (error) {
       throw new Error(`${description} "${path}" 准备失败`, { cause: error })
     }
@@ -222,12 +226,14 @@ export class BatchProcessor {
           this.prepareDirectory(
             dir,
             fontDirs.length > 1 ? `字体${idx + 1}` : '字体',
+            { allowedExtensions: FONT_EXTENSIONS },
           )
         ),
       )
       const actualSubtitleDir = await this.prepareDirectory(
         item.subtitleDir,
         '字幕',
+        { allowedExtensions: SUBTITLE_EXTENSIONS },
       )
 
       const subtitleFile = await getUniqueFileByGlob(
