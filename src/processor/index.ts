@@ -11,6 +11,7 @@ import { withTempDir } from '../utils/temp-dir.ts'
 import { ensureAssfontsInstalled } from '../assfonts-installer/index.ts'
 import { TempDirCache } from './temp-dir-cache.ts'
 import { runAssfontsCli } from './assfonts-cli.ts'
+import { type SubtitleTransform, withPreparedSubtitle } from './subtitle.ts'
 
 // ============================================================================
 // 常量
@@ -43,8 +44,10 @@ export interface ProcessConfig {
   videoGlob: string
   /** 输出后缀，例如 ".sc.ass" */
   outputSuffix: string
+  /** 原始字幕文本编码；设置后严格解码并生成 UTF-8 工作副本 */
+  subtitleEncoding?: string
   /** 字幕内容转换函数，在处理前对原始字幕内容进行修改 */
-  subtitleTransform?: (content: string) => string | Promise<string>
+  subtitleTransform?: SubtitleTransform
 }
 
 /**
@@ -218,6 +221,9 @@ export class BatchProcessor {
     consola.info(`📤 输出目录: ${item.outputDir}`)
     consola.info(`🎬 视频 glob: ${item.videoGlob}`)
     consola.info(`📝 输出后缀: ${item.outputSuffix}`)
+    if (item.subtitleEncoding) {
+      consola.info(`🔤 字幕编码: ${item.subtitleEncoding}`)
+    }
     consola.log(DASH_LINE)
 
     try {
@@ -242,14 +248,6 @@ export class BatchProcessor {
       )
       consola.info(`📥 字幕文件: ${basename(subtitleFile)}`)
 
-      // 如果有 subtitleTransform，原地修改字幕文件
-      if (item.subtitleTransform) {
-        consola.info(`🔄 应用字幕内容转换...`)
-        const originalContent = await Deno.readTextFile(subtitleFile)
-        const transformedContent = await item.subtitleTransform(originalContent)
-        await Deno.writeTextFile(subtitleFile, transformedContent)
-      }
-
       const videoFile = await getUniqueFileByGlob(
         item.outputDir,
         item.videoGlob,
@@ -265,30 +263,45 @@ export class BatchProcessor {
 
       await ensureDir(item.outputDir)
 
-      await withTempDir('assfonts_output_', async (tempOutputDir) => {
-        await this.processAssSubtitle(
-          binPath,
-          subtitleFile,
-          tempOutputDir,
-          actualFontDirs,
-        )
+      if (item.subtitleTransform) {
+        consola.info(`🔄 应用字幕内容转换...`)
+      }
 
-        const processedFiles = await getFilesByGlob(
-          tempOutputDir,
-          '*.assfonts.ass',
-        )
+      await withPreparedSubtitle(
+        subtitleFile,
+        {
+          encoding: item.subtitleEncoding,
+          transform: item.subtitleTransform,
+        },
+        async (preparedSubtitleFile) => {
+          await withTempDir('assfonts_output_', async (tempOutputDir) => {
+            await this.processAssSubtitle(
+              binPath,
+              preparedSubtitleFile,
+              tempOutputDir,
+              actualFontDirs,
+            )
 
-        if (processedFiles.length === 0) {
-          throw new Error('未找到处理后的字幕文件')
-        }
+            const processedFiles = await getFilesByGlob(
+              tempOutputDir,
+              '*.assfonts.ass',
+            )
 
-        if (processedFiles.length > 1) {
-          throw new Error(`处理后产生了多个字幕文件: ${processedFiles.length}`)
-        }
+            if (processedFiles.length === 0) {
+              throw new Error('未找到处理后的字幕文件')
+            }
 
-        const processedFile = processedFiles[0]
-        await copy(processedFile, outputFile, { overwrite: true })
-      })
+            if (processedFiles.length > 1) {
+              throw new Error(
+                `处理后产生了多个字幕文件: ${processedFiles.length}`,
+              )
+            }
+
+            const processedFile = processedFiles[0]
+            await copy(processedFile, outputFile, { overwrite: true })
+          })
+        },
+      )
 
       consola.success(`处理完成: ${outputFilename}`)
 
