@@ -82,7 +82,16 @@ export class TempDirCache {
 
     const isArchive = stat.isFile && await isArchiveFile(absolutePath)
     const mode = isArchive ? 'extract' : 'copy'
-    const cacheKey = `${mode}:${absolutePath}`
+    const filter = [
+      ...new Set(
+        options?.allowedExtensions?.map((ext) => ext.toLowerCase()) ?? [],
+      ),
+    ].sort()
+    const cacheKey = JSON.stringify([
+      mode,
+      absolutePath,
+      isArchive ? [] : filter,
+    ])
 
     if (this.cache.has(cacheKey)) {
       const icon = isArchive ? '📦' : '📁'

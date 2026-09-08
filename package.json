@@ -1,7 +1,7 @@
 {
   "name": "ass-processor-lib",
   "version": "0.1.0",
-  "description": "A Deno library for batch processing ASS subtitles, supporting font subsetting and embedding. Features automatic binary management and temporary resource cleanup.",
+  "description": "A Deno library for batch processing ASS subtitles with WebAssembly font subsetting, embedding, and automatic temporary resource cleanup.",
   "exports": {
     ".": "./src/processor/index.ts",
     "./7z-cli": "./src/7z-cli/index.ts"
@@ -21,10 +21,11 @@
   "author": "MuXiu1997 <muxiu1997@muxiu1997.com> (https://github.com/MuXiu1997/)",
   "license": "MIT",
   "engines": {
-    "deno": ">=2.0.0"
+    "deno": ">=2.5.6"
   },
   "packageManager": "pnpm@10.22.0",
   "dependencies": {
+    "@muxiu1997/assfonts-rs-wasm": "0.1.0-beta.0",
     "7z-wasm": "1.2.0",
     "consola": "3.4.2",
     "dayjs": "1.11.19",
@@ -32,7 +33,6 @@
     "fast-glob": "3.3.3",
     "file-type": "21.1.1",
     "pathe": "2.0.3",
-    "readline-sync": "1.4.10",
-    "zx": "8.8.5"
+    "readline-sync": "1.4.10"
   }
 }

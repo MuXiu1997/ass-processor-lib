@@ -7,7 +7,11 @@ import _SevenZip, { type SevenZipModuleFactory } from 'npm:7z-wasm@1.2.0'
 import { consola } from 'npm:consola@3.4.2'
 import { fileTypeFromFile } from 'npm:file-type@21.1.1'
 
-const SevenZip = _SevenZip as unknown as SevenZipModuleFactory
+// Emscripten callMain returns an exit status; 7z-wasm declares it as void.
+type SevenZipModule = Awaited<ReturnType<SevenZipModuleFactory>>
+const SevenZip = _SevenZip as unknown as (
+  ...args: Parameters<SevenZipModuleFactory>
+) => Promise<Omit<SevenZipModule, 'callMain'> & { callMain(args: string[]): number }>
 
 /**
  * 使用 file-type 检测文件类型（基于文件内容）

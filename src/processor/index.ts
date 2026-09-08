@@ -1,4 +1,4 @@
-import { copy, ensureDir } from 'jsr:@std/fs@1.0.20'
+import { ensureDir } from 'jsr:@std/fs@1.0.20'
 import { basename, extname, join } from 'jsr:@std/path@1.1.3'
 
 import { consola } from 'npm:consola@3.4.2'
@@ -6,12 +6,11 @@ import dayjs from 'npm:dayjs@1.11.19'
 import { defu } from 'npm:defu@6.1.4'
 
 import { appendLines, writeLines } from '../utils/file.ts'
-import { getFilesByGlob, getUniqueFileByGlob } from '../utils/glob.ts'
-import { withTempDir } from '../utils/temp-dir.ts'
-import { ensureAssfontsInstalled } from '../assfonts-installer/index.ts'
+import { getUniqueFileByGlob } from '../utils/glob.ts'
 import { TempDirCache } from './temp-dir-cache.ts'
-import { runAssfontsCli } from './assfonts-cli.ts'
 import { type SubtitleTransform, withPreparedSubtitle } from './subtitle.ts'
+import { scanFonts, WasmBackend } from './wasm-backend.ts'
+import type { MissingGlyphPolicy, ParseMode, Report } from './wasm-protocol.ts'
 
 // ============================================================================
 // 常量
@@ -20,7 +19,7 @@ import { type SubtitleTransform, withPreparedSubtitle } from './subtitle.ts'
 const SEPARATOR = '='.repeat(60)
 const DASH_LINE = '-'.repeat(60)
 
-const FONT_EXTENSIONS = ['.ttf', '.otf', '.ttc', '.woff', '.woff2']
+const FONT_EXTENSIONS = ['.ttf', '.otf', '.ttc', '.otc', '.woff', '.woff2']
 const SUBTITLE_EXTENSIONS = ['.ass', '.ssa', '.srt']
 
 // ============================================================================
@@ -48,6 +47,10 @@ export interface ProcessConfig {
   subtitleEncoding?: string
   /** 字幕内容转换函数，在处理前对原始字幕内容进行修改 */
   subtitleTransform?: SubtitleTransform
+  /** WASM 后端解析模式，默认 strict */
+  parseMode?: ParseMode
+  /** WASM 后端缺字策略，默认 warn */
+  missingGlyphPolicy?: MissingGlyphPolicy
 }
 
 /**
@@ -58,12 +61,16 @@ export interface BatchResult {
   inputFile: string
   outputFile: string
   error?: string
+  /** WASM 后端的字体处理报告 */
+  report?: Report
 }
 
 /**
  * 批处理选项
  */
 export interface BatchProcessorOptions {
+  /** WASM 单次请求超时，包含初始化和字体注册，默认 120 秒 */
+  wasmTimeoutMs?: number
   /** 自定义日志文件路径，如果不提供则自动生成 */
   logFile?: string
   /** 是否禁用日志文件 */
@@ -108,12 +115,14 @@ function generateBatchLogPath(): string {
  * ```
  */
 const defaultOptions: Required<BatchProcessorOptions> = {
+  wasmTimeoutMs: 120_000,
   logFile: '',
   disableLog: false,
 }
 
 export class BatchProcessor {
-  private binPath: string | null = null
+  private wasm?: WasmBackend
+  private processing = false
   private cache: TempDirCache
   private options: Required<BatchProcessorOptions>
   private logFile?: string
@@ -123,16 +132,6 @@ export class BatchProcessor {
     this.options = defu(options, defaultOptions)
     this.cache = new TempDirCache()
     this.logFile = this.options.logFile || undefined
-  }
-
-  /**
-   * 确保 assfonts 已安装并返回二进制路径
-   */
-  private async ensureBinPath(): Promise<string> {
-    if (!this.binPath) {
-      this.binPath = await ensureAssfontsInstalled()
-    }
-    return this.binPath
   }
 
   /**
@@ -151,65 +150,18 @@ export class BatchProcessor {
   }
 
   /**
-   * 处理单个 ASS 字幕文件：进行字体子集化和内嵌
-   */
-  private async processAssSubtitle(
-    binPath: string,
-    inputFile: string,
-    outputPath: string,
-    fontPaths: string[],
-  ): Promise<void> {
-    consola.info(`🎬 处理 ASS 字幕: ${inputFile}`)
-    consola.info(`📁 输出位置: ${outputPath}`)
-    if (fontPaths.length) {
-      consola.info(`🔤 字体路径: ${fontPaths.join(', ')}`)
-    }
-
-    const result = await runAssfontsCli(
-      binPath,
-      inputFile,
-      outputPath,
-      fontPaths,
-    )
-
-    // 写入日志文件
-    if (this.logFile) {
-      const timestamp = dayjs().format('YYYY-MM-DD HH:mm:ss')
-      const status = result.ok ? '处理文件' : '处理文件失败'
-      await appendLines(this.logFile, [
-        '',
-        SEPARATOR,
-        `[${timestamp}] ${status}: ${inputFile}`,
-        `命令: ${result.command}`,
-        SEPARATOR,
-        `--- STDOUT ---`,
-        result.stdout || '(无输出)',
-        `--- STDERR ---`,
-        result.stderr || '(无输出)',
-        SEPARATOR,
-        '',
-      ])
-    }
-
-    if (!result.ok) {
-      throw new Error(`ASS 字幕处理失败: ${result.message}`, {
-        cause: result.cause,
-      })
-    }
-
-    consola.success('ASS 字幕处理完成')
-  }
-
-  /**
    * 处理单个配置项
    */
   private async processOne(
-    binPath: string,
+    wasm: WasmBackend,
     item: ProcessConfig,
     index?: number,
     total?: number,
   ): Promise<BatchResult> {
     const fontDirs = Array.isArray(item.fontDir) ? item.fontDir : [item.fontDir]
+    let subtitleFile = ''
+    let outputFile = ''
+    let report: Report | undefined
 
     consola.log('\n' + DASH_LINE)
     if (index != null && total != null) {
@@ -227,22 +179,23 @@ export class BatchProcessor {
     consola.log(DASH_LINE)
 
     try {
-      const actualFontDirs = await Promise.all(
-        fontDirs.map((dir, idx) =>
-          this.prepareDirectory(
+      const actualFontDirs: string[] = []
+      for (const [idx, dir] of fontDirs.entries()) {
+        actualFontDirs.push(
+          await this.prepareDirectory(
             dir,
             fontDirs.length > 1 ? `字体${idx + 1}` : '字体',
             { allowedExtensions: FONT_EXTENSIONS },
-          )
-        ),
-      )
+          ),
+        )
+      }
       const actualSubtitleDir = await this.prepareDirectory(
         item.subtitleDir,
         '字幕',
         { allowedExtensions: SUBTITLE_EXTENSIONS },
       )
 
-      const subtitleFile = await getUniqueFileByGlob(
+      subtitleFile = await getUniqueFileByGlob(
         actualSubtitleDir,
         item.subtitleGlob,
       )
@@ -258,7 +211,7 @@ export class BatchProcessor {
       const outputFilename =
         videoBasename.slice(0, -extname(videoBasename).length) +
         item.outputSuffix
-      const outputFile = join(item.outputDir, outputFilename)
+      outputFile = join(item.outputDir, outputFilename)
       consola.info(`📤 输出文件: ${outputFilename}`)
 
       await ensureDir(item.outputDir)
@@ -274,32 +227,24 @@ export class BatchProcessor {
           transform: item.subtitleTransform,
         },
         async (preparedSubtitleFile) => {
-          await withTempDir('assfonts_output_', async (tempOutputDir) => {
-            await this.processAssSubtitle(
-              binPath,
-              preparedSubtitleFile,
-              tempOutputDir,
-              actualFontDirs,
-            )
-
-            const processedFiles = await getFilesByGlob(
-              tempOutputDir,
-              '*.assfonts.ass',
-            )
-
-            if (processedFiles.length === 0) {
-              throw new Error('未找到处理后的字幕文件')
-            }
-
-            if (processedFiles.length > 1) {
-              throw new Error(
-                `处理后产生了多个字幕文件: ${processedFiles.length}`,
-              )
-            }
-
-            const processedFile = processedFiles[0]
-            await copy(processedFile, outputFile, { overwrite: true })
-          })
+          const fonts = await scanFonts(actualFontDirs)
+          const result = await wasm.process(
+            fonts,
+            await Deno.readFile(preparedSubtitleFile),
+            item.parseMode,
+            item.missingGlyphPolicy,
+          )
+          await Deno.writeTextFile(outputFile, result.subtitle)
+          report = result.report
+          for (const warning of report.warnings) {
+            consola.warn(JSON.stringify(warning))
+          }
+          if (this.logFile) {
+            await appendLines(this.logFile, [
+              `WASM 处理文件: ${subtitleFile}`,
+              JSON.stringify(report, null, 2),
+            ])
+          }
         },
       )
 
@@ -309,13 +254,19 @@ export class BatchProcessor {
         success: true,
         inputFile: subtitleFile,
         outputFile,
+        ...(report ? { report } : {}),
       }
     } catch (error) {
       consola.error(`处理失败: ${getErrorMessage(error)}`)
+      if (this.logFile) {
+        await appendLines(this.logFile, [
+          `处理失败: ${subtitleFile}: ${getErrorMessage(error)}`,
+        ])
+      }
       return {
         success: false,
-        inputFile: '',
-        outputFile: '',
+        inputFile: subtitleFile,
+        outputFile,
         error: getErrorMessage(error),
       }
     }
@@ -372,6 +323,8 @@ export class BatchProcessor {
   async process(
     configs: ProcessConfig | ProcessConfig[],
   ): Promise<{ results: BatchResult[]; logFile?: string }> {
+    if (this.processing) throw new Error('同一 BatchProcessor 不支持并发批次')
+    this.processing = true
     const items = Array.isArray(configs) ? configs : [configs]
 
     consola.log('\n' + SEPARATOR)
@@ -379,16 +332,16 @@ export class BatchProcessor {
     consola.info(`📋 共 ${items.length} 个任务`)
     consola.log(SEPARATOR)
 
-    const binPath = await this.ensureBinPath()
-    await this.initLogFile(items.length)
-
     const results: BatchResult[] = []
     let successCount = 0
     let failCount = 0
 
     try {
+      const wasm = new WasmBackend(this.options.wasmTimeoutMs)
+      this.wasm = wasm
+      await this.initLogFile(items.length)
       for (let i = 0; i < items.length; i++) {
-        const result = await this.processOne(binPath, items[i], i, items.length)
+        const result = await this.processOne(wasm, items[i], i, items.length)
         results.push(result)
 
         if (result.success) {
@@ -419,7 +372,11 @@ export class BatchProcessor {
 
       return { results, logFile: this.logFile }
     } finally {
-      await this.cleanup()
+      try {
+        await this.cleanup()
+      } finally {
+        this.processing = false
+      }
     }
   }
 
@@ -428,20 +385,23 @@ export class BatchProcessor {
    * 应在所有处理完成后调用
    */
   async cleanup(): Promise<void> {
-    const stats = this.cache.getStats()
-    if (stats.subDirs > 0) {
-      consola.info(`🧹 清理 ${stats.subDirs} 个临时目录...`)
+    try {
+      await this.wasm?.close()
+    } finally {
+      this.wasm = undefined
+      await this.cache.cleanup()
     }
-    await this.cache.cleanup()
   }
 }
 
 export function process(
   configs: ProcessConfig | ProcessConfig[],
+  options: BatchProcessorOptions = {},
 ): Promise<{ results: BatchResult[]; logFile?: string }> {
-  const processor = new BatchProcessor()
+  const processor = new BatchProcessor(options)
   return processor.process(configs)
 }
 
 // 导出辅助函数
 export { globBracket, range } from './helpers.ts'
+export type { MissingGlyphPolicy, ParseMode, Report } from './wasm-protocol.ts'
