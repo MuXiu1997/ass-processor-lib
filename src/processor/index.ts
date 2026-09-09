@@ -8,7 +8,11 @@ import { defu } from 'npm:defu@6.1.4'
 import { appendLines, writeLines } from '../utils/file.ts'
 import { getUniqueFileByGlob } from '../utils/glob.ts'
 import { TempDirCache } from './temp-dir-cache.ts'
-import { type SubtitleTransform, withPreparedSubtitle } from './subtitle.ts'
+import {
+  serializeSubtitleOutput,
+  type SubtitleTransform,
+  withPreparedSubtitle,
+} from './subtitle.ts'
 import { scanFonts, WasmBackend } from './wasm-backend.ts'
 import type { MissingGlyphPolicy, ParseMode, Report } from './wasm-protocol.ts'
 
@@ -45,7 +49,7 @@ export interface ProcessConfig {
   outputSuffix: string
   /** 原始字幕文本编码；设置后严格解码并生成 UTF-8 工作副本 */
   subtitleEncoding?: string
-  /** 字幕内容转换函数，在处理前对原始字幕内容进行修改 */
+  /** 转换移除开头 BOM 的字幕内容；最终输出统一为 UTF-8 且恰好一个 BOM */
   subtitleTransform?: SubtitleTransform
   /** WASM 后端解析模式，默认 strict */
   parseMode?: ParseMode
@@ -61,7 +65,9 @@ export interface BatchResult {
   inputFile: string
   outputFile: string
   error?: string
-  /** WASM 后端的字体处理报告 */
+  /** 成功时提供：最终保存的 UTF-8 文件字节（包含 BOM）的 SHA-256 */
+  outputSha256?: string
+  /** 原始 WASM 报告；其中 output_sha256 对应输出 BOM 规范化前的后端结果 */
   report?: Report
 }
 
@@ -162,6 +168,7 @@ export class BatchProcessor {
     let subtitleFile = ''
     let outputFile = ''
     let report: Report | undefined
+    let outputSha256: string | undefined
 
     consola.log('\n' + DASH_LINE)
     if (index != null && total != null) {
@@ -234,7 +241,9 @@ export class BatchProcessor {
             item.parseMode,
             item.missingGlyphPolicy,
           )
-          await Deno.writeTextFile(outputFile, result.subtitle)
+          const output = await serializeSubtitleOutput(result.subtitle)
+          await Deno.writeFile(outputFile, output.bytes)
+          outputSha256 = output.outputSha256
           report = result.report
           for (const warning of report.warnings) {
             consola.warn(JSON.stringify(warning))
@@ -243,6 +252,7 @@ export class BatchProcessor {
             await appendLines(this.logFile, [
               `WASM 处理文件: ${subtitleFile}`,
               JSON.stringify(report, null, 2),
+              JSON.stringify({ outputFile, outputSha256 }),
             ])
           }
         },
@@ -254,6 +264,7 @@ export class BatchProcessor {
         success: true,
         inputFile: subtitleFile,
         outputFile,
+        outputSha256,
         ...(report ? { report } : {}),
       }
     } catch (error) {

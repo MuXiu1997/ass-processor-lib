@@ -6,10 +6,26 @@ export type SubtitleTransform = (
   content: string,
 ) => string | Promise<string>
 
+/** Serialize the final ASS once: exactly one leading BOM, no other text changes. */
+export async function serializeSubtitleOutput(content: string): Promise<{
+  bytes: Uint8Array<ArrayBuffer>
+  outputSha256: string
+}> {
+  const bytes = new TextEncoder().encode(
+    '\uFEFF' + content.replace(/^\uFEFF+/, ''),
+  )
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
+  const outputSha256 = Array.from(
+    new Uint8Array(digest),
+    (byte) => byte.toString(16).padStart(2, '0'),
+  ).join('')
+  return { bytes, outputSha256 }
+}
+
 export interface PrepareSubtitleOptions {
   /** 原始字幕文本编码；未设置时按 UTF-8 读取 */
   encoding?: string
-  /** 写入工作副本前应用的文本转换 */
+  /** 对移除开头 BOM 的内容进行转换；最终文件 BOM 由输出层统一负责 */
   transform?: SubtitleTransform
 }
 
@@ -49,7 +65,7 @@ export async function withPreparedSubtitle<T>(
     let content = decodeSubtitle(bytes, encoding)
 
     if (options.transform) {
-      content = await options.transform(content)
+      content = await options.transform(content.replace(/^\uFEFF+/, ''))
     }
 
     const preparedFile = join(tempDir, basename(inputFile))

@@ -5,7 +5,42 @@ import {
 } from 'jsr:@std/assert@1.0.14'
 import { join } from 'jsr:@std/path@1.1.3'
 
-import { withPreparedSubtitle } from './subtitle.ts'
+import { serializeSubtitleOutput, withPreparedSubtitle } from './subtitle.ts'
+
+Deno.test('final serialization changes only leading BOMs and is idempotent', async () => {
+  const encoder = new TextEncoder()
+  // A long ASCII attachment must not hide the non-ASCII text or affect BOM policy.
+  const body = '[Script Info]\r\n[Fonts]\r\nfontname: example.ttf\r\n' +
+    'A'.repeat(6_000_000) + '\r\n[Events]\r\n; 中文・日本語\uFEFF\r\n'
+  const expected = encoder.encode('\uFEFF' + body)
+  for (const count of [0, 1, 2]) {
+    const output = await serializeSubtitleOutput('\uFEFF'.repeat(count) + body)
+    assertEquals(output.bytes, expected)
+    assertEquals(
+      await serializeSubtitleOutput(
+        new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
+          output.bytes,
+        ),
+      ),
+      output,
+    )
+  }
+})
+
+Deno.test('transforms receive content without leading BOMs and preserve interior BOMs', async () => {
+  const bytes = new TextEncoder().encode('\uFEFF\uFEFF原始\uFEFF字幕\r\n')
+  await withSubtitleFile(bytes, async (file) => {
+    await withPreparedSubtitle(file, {
+      transform: async (content) => {
+        assertEquals(content, '原始\uFEFF字幕\r\n')
+        return content
+      },
+    }, async (prepared) => {
+      assertEquals(await Deno.readTextFile(prepared), '原始\uFEFF字幕\r\n')
+    })
+    assertEquals(await Deno.readFile(file), bytes)
+  })
+})
 
 async function withSubtitleFile<T>(
   content: Uint8Array,
@@ -44,6 +79,10 @@ Deno.test('withPreparedSubtitle converts GB18030 content to a UTF-8 working copy
         preparedFile = currentPreparedFile
         assertNotEquals(preparedFile, file)
         assertEquals(await Deno.readTextFile(preparedFile), '我\r\n')
+        const output = await serializeSubtitleOutput(
+          await Deno.readTextFile(preparedFile),
+        )
+        assertEquals(output.bytes, new TextEncoder().encode('\uFEFF我\r\n'))
       },
     )
 
